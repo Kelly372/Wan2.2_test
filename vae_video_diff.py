@@ -74,34 +74,16 @@ def save_latent(path, tensor):
 
 
 def save_decoded(path, video, fps):
-    import cv2
-
-    from prepare_videos import read_video
+    from prepare_videos import write_rgb_video
 
     _, count, height, width = video.shape
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".mp4", delete=False) as tmp:
-        temporary = Path(tmp.name)
-    writer = None
-    try:
-        writer = cv2.VideoWriter(
-            str(temporary), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-        )
-        if not writer.isOpened():
-            raise RuntimeError(f"Cannot initialize MP4 writer: {path}")
+
+    def rgb_frames():
         for index in range(count):
             frame = video[:, index].clamp(-1, 1).add(1).mul(127.5)
-            rgb = frame.round().byte().permute(1, 2, 0).cpu().numpy()
-            writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        writer.release()
-        writer = None
-        first, actual_count, _ = read_video(temporary)
-        if actual_count != count or first.shape[:2] != (height, width):
-            raise RuntimeError(f"Output frame count or dimensions do not match: {path}")
-        temporary.replace(path)
-    finally:
-        if writer is not None:
-            writer.release()
-        temporary.unlink(missing_ok=True)
+            yield frame.round().byte().permute(1, 2, 0).cpu().numpy()
+
+    write_rgb_video(path, rgb_frames(), count, fps, (width, height))
 
 
 def run(args):
@@ -137,7 +119,7 @@ def run(args):
     if height % 2 or width % 2:
         raise ValueError("MP4 output requires even input width and height.")
 
-    output_dir = video_dir / f"{args.video_tag}_diff"
+    output_dir = video_dir / args.video_tag
     output_dir.mkdir(parents=True, exist_ok=True)
     vae = load_vae(checkpoint, args.vae_type, device)
     stride = 16 if args.vae_type == "2.2" else 8
@@ -153,7 +135,7 @@ def run(args):
             if not torch.isfinite(latent).all():
                 raise RuntimeError(f"Non-finite latent for {label}")
             latents[label] = latent
-            save_latent(path.with_suffix(".pt"), latent)
+            save_latent(output_dir / f"{path.stem}.pt", latent)
 
         name = "A-B"
         print(f"Decoding {name}", flush=True)
@@ -177,6 +159,7 @@ def run(args):
         "padding": "Repeat last frame to 4n+1; replicate right/bottom edges to VAE stride.",
         "operation": "decode(encode(A) - encode(B)) using Wan normalized latents",
         "output": "Crop to original F/H/W; map decoder [-1,1] to [0,255]; no audio.",
+        "video_encoding": "H.264 (libx264), yuv420p, CRF 18, faststart",
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Done: {output_dir}")

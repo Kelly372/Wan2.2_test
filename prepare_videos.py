@@ -1,7 +1,7 @@
 """Create a first-frame video from an existing video in data/video.
 
 Usage: python prepare_videos.py --video_tag clip
-Requires opencv-python and numpy (already included in requirements.txt).
+Requires opencv-python, numpy and imageio-ffmpeg (in requirements.txt).
 """
 
 import argparse
@@ -46,38 +46,62 @@ def read_video(path):
         capture.release()
 
 
-def write_still_video(path, frame, frame_count, fps):
-    height, width = frame.shape[:2]
-    # OpenCV's MP4 writer truncates odd dimensions; fail instead of silently
-    # changing the requested resolution.
-    if width % 2 or height % 2:
-        raise ValueError(f"MP4 output requires even dimensions, got {width}x{height}.")
+def write_rgb_video(path, frames, frame_count, fps, size):
+    """Stream uint8 RGB frames to a verified H.264/yuv420p MP4."""
+    import imageio_ffmpeg
+    import numpy as np
+
+    width, height = size
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise ValueError(f"H.264/yuv420p requires positive even dimensions: {size}")
+    if frame_count <= 0 or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("Frame count and FPS must be positive.")
     with tempfile.NamedTemporaryFile(
         dir=path.parent, suffix=".mp4", delete=False
     ) as temporary:
         temporary_path = Path(temporary.name)
     writer = None
     try:
-        writer = cv2.VideoWriter(
-            str(temporary_path), cv2.VideoWriter_fourcc(*"mp4v"),
-            fps, (width, height),
+        writer = imageio_ffmpeg.write_frames(
+            str(temporary_path), (width, height), fps=fps,
+            codec="libx264", pix_fmt_in="rgb24", pix_fmt_out="yuv420p",
+            macro_block_size=1, quality=None,
+            # Override imageio's two-decimal input FPS to retain fractional rates.
+            input_params=["-r", format(fps, ".15g")],
+            output_params=["-crf", "18", "-preset", "medium", "-movflags", "+faststart"],
         )
-        if not writer.isOpened():
-            raise RuntimeError(f"Cannot initialize the MP4 encoder for: {path}")
-        for _ in range(frame_count):
-            writer.write(frame)
-        writer.release()
+        writer.send(None)
+        written = 0
+        for frame in frames:
+            if frame.shape != (height, width, 3) or frame.dtype != np.uint8:
+                raise ValueError("Each frame must be a uint8 RGB array matching the video size.")
+            writer.send(np.ascontiguousarray(frame))
+            written += 1
+        writer.close()
         writer = None
+        if written != frame_count:
+            raise RuntimeError(f"Incorrect input frame count: {written}/{frame_count}")
         # Verify the actual output before replacing an existing result.
-        _, actual_count, _ = read_video(temporary_path)
-        if actual_count != frame_count:
-            raise RuntimeError(f"Incomplete output: {actual_count}/{frame_count} frames")
+        first, actual_count, actual_fps = read_video(temporary_path)
+        if (actual_count != frame_count or first.shape[:2] != (height, width)
+                or not math.isclose(actual_fps, fps, rel_tol=1e-4, abs_tol=1e-3)):
+            raise RuntimeError("Encoded video frame count, dimensions or FPS do not match.")
         temporary_path.replace(path)
     finally:
-        if writer is not None:
-            writer.release()
-        temporary_path.unlink(missing_ok=True)
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            temporary_path.unlink(missing_ok=True)
     print(f"Saved: {path} ({frame_count} frames, {fps:g} FPS)")
+
+
+def write_still_video(path, frame, frame_count, fps):
+    from itertools import repeat
+
+    height, width = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    write_rgb_video(path, repeat(rgb, frame_count), frame_count, fps, (width, height))
 
 
 def main():
@@ -91,7 +115,7 @@ def main():
     try:
         first_frame, frame_count, fps = read_video(source_path)
         write_still_video(first_frame_path, first_frame, frame_count, fps)
-    except (OSError, ValueError, RuntimeError, cv2.error) as error:
+    except (OSError, ValueError, RuntimeError, ImportError, cv2.error) as error:
         parser.exit(1, f"Error: {error}\n")
 
 
