@@ -47,11 +47,10 @@ A/B 必须具有相同的帧数、分辨率和帧率，否则脚本报错。重�
 完成上述实验、得到 `data/video/clip/A-B.mp4` 后，运行：
 
 ```bash
-export WAN_CKPT_DIR=/path/to/Wan2.2-TI2V-5B
-python generate_with_diff.py --video_tag clip
+python generate_with_diff.py --video_tag clip --model_path /path/to/Wan2.2-TI2V-5B
 ```
 
-也可把完整模型放在仓库根目录 `Wan2.2-TI2V-5B/`，或通过 `--ckpt_dir` 指定目录。此步骤需要完整 TI2V-5B 权重（DiT、T5、tokenizer、Wan2.2 VAE）和 CUDA GPU；仅有 VAE 权重不能去噪生成。目前接入的是 TI2V-5B 的无首帧约束生成路径，不支持 A14B 双专家模型。使用仓库完整推理依赖。
+通过必填参数 `--model_path` 指定完整模型目录。此步骤需要完整 TI2V-5B 权重（DiT、T5、tokenizer、Wan2.2 VAE）和 CUDA GPU；仅有 VAE 权重不能去噪生成。目前接入的是 TI2V-5B 的无首帧约束生成路径，不支持 A14B 双专家模型。使用仓库完整推理依赖。
 
 对读入的残差视频 RGB 值 `I`，默认计算 `u=max(127.5-I, 0)`，然后以整段视频共享的最大值归一化为 `R=255*(1-u/max(u))`。灰色和亮侧映射为白色，暗侧保留为深色轮廓；无暗侧残差时明确报错。此操作没有透明通道，也不使用空间分割，不能保证去除与移动轮廓同属暗侧的首帧残影。`--baseline` 可调整灰色基准；全局归一化保留帧间相对强弱，避免逐帧自动拉伸。
 

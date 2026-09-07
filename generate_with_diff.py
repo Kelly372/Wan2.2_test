@@ -3,16 +3,12 @@
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 
 import numpy as np
 
 from prepare_videos import DATA_DIR, file_name, write_rgb_video
 from vae_video_diff import prepare_tensor, read_rgb_video, save_decoded, save_latent
-
-
-ROOT = Path(__file__).resolve().parent
 
 
 def normalize_dark_residual(frames, baseline=127.5):
@@ -49,7 +45,7 @@ def resolve_checkpoint(value):
     if missing:
         raise FileNotFoundError(
             f"Incomplete Wan2.2-TI2V-5B directory: {directory}. Missing: {missing}. "
-            "Set WAN_CKPT_DIR or --ckpt_dir to the complete model directory."
+            "Set --model_path to the complete model directory."
         )
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     if config.get("in_dim") != 48 or config.get("out_dim") != 48:
@@ -90,7 +86,7 @@ def run(args):
         raise ValueError("Generation requires a CUDA GPU and CUDA-enabled PyTorch.")
     if args.inference_step < 1 or not 0 < args.strength <= 1:
         raise ValueError("inference_step must be positive and strength must be in (0, 1].")
-    checkpoint = resolve_checkpoint(args.ckpt_dir)
+    checkpoint = resolve_checkpoint(args.model_path)
     video_dir = DATA_DIR / "video"
     output_dir = video_dir / args.video_tag
     original, fps = read_rgb_video(video_dir / f"{args.video_tag}.mp4")
@@ -182,7 +178,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video_tag", required=True, type=file_name)
-    parser.add_argument("--ckpt_dir", default=os.environ.get("WAN_CKPT_DIR", str(ROOT / "Wan2.2-TI2V-5B")))
+    parser.add_argument("--model_path", required=True, help="Path to the complete Wan2.2-TI2V-5B model directory")
     parser.add_argument("--inference_step", type=int, default=50)
     parser.add_argument("--strength", type=float, default=0.5, help="Fraction of schedule used by the original-video branch")
     parser.add_argument("--seed", type=int, default=42)
