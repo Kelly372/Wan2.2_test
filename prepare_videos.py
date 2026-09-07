@@ -1,6 +1,6 @@
-"""Create still-frame videos from data/video and data/background.
+"""Create a first-frame video from an existing video in data/video.
 
-Usage: python prepare_videos.py --image_name example --video_tag clip
+Usage: python prepare_videos.py --video_tag clip
 Requires opencv-python and numpy (already included in requirements.txt).
 """
 
@@ -10,7 +10,6 @@ from pathlib import Path
 import tempfile
 
 import cv2
-import numpy as np
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -23,24 +22,6 @@ def file_name(value):
     ):
         raise argparse.ArgumentTypeError("Please provide a filename without a path.")
     return value
-
-
-def find_image(name):
-    background_dir = DATA_DIR / "background"
-    supported = {".jpg", ".png"}
-    exact = background_dir / name
-    if exact.is_file() and exact.suffix.lower() in supported:
-        return exact
-    matches = sorted(
-        path for path in background_dir.glob("*")
-        if path.is_file() and path.stem == name and path.suffix.lower() in supported
-    )
-    if len(matches) != 1:
-        raise ValueError(
-            f"Expected one background image for {name!r}, found {len(matches)}. "
-            "Use the full filename if both JPG and PNG exist."
-        )
-    return matches[0]
 
 
 def read_video(path):
@@ -101,41 +82,15 @@ def write_still_video(path, frame, frame_count, fps):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image_name", required=True, type=file_name)
     parser.add_argument("--video_tag", required=True, type=file_name)
     args = parser.parse_args()
 
     video_dir = DATA_DIR / "video"
     source_path = video_dir / f"{args.video_tag}.mp4"
     first_frame_path = video_dir / f"{args.video_tag}_first_frame.mp4"
-    image_name = Path(args.image_name)
-    image_stem = (
-        image_name.stem if image_name.suffix.lower() in {".jpg", ".png"}
-        else args.image_name
-    )
-    background_path = video_dir / f"bg_{image_stem}.mp4"
-    if background_path in {source_path, first_frame_path}:
-        parser.error("Background output name conflicts with the input or first-frame video.")
-
     try:
         first_frame, frame_count, fps = read_video(source_path)
-        background = None
-        if not background_path.exists():
-            image_path = find_image(args.image_name)
-            # imdecode supports Unicode filenames on Windows.
-            background = cv2.imdecode(
-                np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR
-            )
-            if background is None:
-                raise ValueError(f"Cannot decode image: {image_path}")
-            height, width = first_frame.shape[:2]
-            background = cv2.resize(background, (width, height))
-
         write_still_video(first_frame_path, first_frame, frame_count, fps)
-        if background is None:
-            print(f"Skipped existing background video: {background_path}")
-        else:
-            write_still_video(background_path, background, frame_count, fps)
     except (OSError, ValueError, RuntimeError, cv2.error) as error:
         parser.exit(1, f"Error: {error}\n")
 

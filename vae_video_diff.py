@@ -1,0 +1,199 @@
+"""Encode original/first-frame videos and decode A-B in Wan latent space."""
+
+import argparse
+import importlib.util
+import json
+import math
+from pathlib import Path
+import tempfile
+
+from prepare_videos import DATA_DIR, file_name
+
+
+def read_rgb_video(path):
+    import cv2
+    import numpy as np
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing input video: {path}")
+    capture = cv2.VideoCapture(str(path))
+    frames = []
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Cannot open video: {path}")
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f"Invalid FPS in {path}: {fps}")
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError(f"No readable frames: {path}")
+    return np.stack(frames), fps
+
+
+def prepare_tensor(frames, stride):
+    import torch
+    import torch.nn.functional as functional
+
+    video = torch.from_numpy(frames).permute(3, 0, 1, 2).float()
+    video = video.div_(127.5).sub_(1.0)
+    _, count, height, width = video.shape
+    # Edge padding preserves every source pixel and frame; crop after decoding.
+    padding = (0, -width % stride, 0, -height % stride, 0, -(count - 1) % 4)
+    return functional.pad(video.unsqueeze(0), padding, mode="replicate")[0]
+
+
+def load_vae(checkpoint, version, device):
+    import torch
+
+    # Load only the standalone VAE, avoiding wan.__init__ and diffusion models.
+    suffix = version.replace(".", "_")
+    module_path = Path(__file__).resolve().parent / "wan" / "modules" / f"vae{suffix}.py"
+    spec = importlib.util.spec_from_file_location(f"standalone_vae{suffix}", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    vae_class = getattr(module, f"Wan{suffix}_VAE")
+    return vae_class(vae_pth=str(checkpoint), device=device, dtype=torch.float32)
+
+
+def save_latent(path, tensor):
+    import torch
+
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".pt", delete=False) as tmp:
+        temporary = Path(tmp.name)
+    try:
+        torch.save(tensor, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def save_decoded(path, video, fps):
+    import cv2
+
+    from prepare_videos import read_video
+
+    _, count, height, width = video.shape
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".mp4", delete=False) as tmp:
+        temporary = Path(tmp.name)
+    writer = None
+    try:
+        writer = cv2.VideoWriter(
+            str(temporary), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Cannot initialize MP4 writer: {path}")
+        for index in range(count):
+            frame = video[:, index].clamp(-1, 1).add(1).mul(127.5)
+            rgb = frame.round().byte().permute(1, 2, 0).cpu().numpy()
+            writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        writer.release()
+        writer = None
+        first, actual_count, _ = read_video(temporary)
+        if actual_count != count or first.shape[:2] != (height, width):
+            raise RuntimeError(f"Output frame count or dimensions do not match: {path}")
+        temporary.replace(path)
+    finally:
+        if writer is not None:
+            writer.release()
+        temporary.unlink(missing_ok=True)
+
+
+def run(args):
+    import torch
+
+    checkpoint = Path(args.vae_checkpoint).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Missing VAE checkpoint: {checkpoint}")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA is unavailable. Use --device cpu or install CUDA-enabled PyTorch.")
+    video_dir = DATA_DIR / "video"
+    paths = {
+        "A": video_dir / f"{args.video_tag}.mp4",
+        "B": video_dir / f"{args.video_tag}_first_frame.mp4",
+    }
+    # Validate all inputs before loading the model or writing experiment results.
+    reference_shape = None
+    fps = None
+    for label, path in paths.items():
+        frames, current_fps = read_rgb_video(path)
+        if reference_shape is None:
+            reference_shape, fps = frames.shape, current_fps
+        if frames.shape != reference_shape or not math.isclose(
+            current_fps, fps, rel_tol=1e-4, abs_tol=1e-3
+        ):
+            raise ValueError(
+                f"{label}: shape/FPS {frames.shape}/{current_fps} differs from "
+                f"A: {reference_shape}/{fps}. Regenerate B with prepare_videos.py."
+            )
+        del frames
+    count, height, width, _ = reference_shape
+    if height % 2 or width % 2:
+        raise ValueError("MP4 output requires even input width and height.")
+
+    output_dir = video_dir / f"{args.video_tag}_diff"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vae = load_vae(checkpoint, args.vae_type, device)
+    stride = 16 if args.vae_type == "2.2" else 8
+    latents = {}
+    with torch.inference_mode():
+        for label, path in paths.items():
+            print(f"Encoding {label}: {path}", flush=True)
+            frames, _ = read_rgb_video(path)
+            video = prepare_tensor(frames, stride).to(device)
+            del frames
+            latent = vae.encode([video])[0].cpu().contiguous()
+            del video
+            if not torch.isfinite(latent).all():
+                raise RuntimeError(f"Non-finite latent for {label}")
+            latents[label] = latent
+            save_latent(path.with_suffix(".pt"), latent)
+
+        name = "A-B"
+        print(f"Decoding {name}", flush=True)
+        difference = latents["A"] - latents["B"]
+        decoded = vae.decode([difference.to(device)])[0]
+        if decoded.shape[1] < count or decoded.shape[2] < height or decoded.shape[3] < width:
+            raise RuntimeError(f"Decoded {name} is smaller than the original video.")
+        decoded = decoded[:, :count, :height, :width]
+        if not torch.isfinite(decoded).all():
+            raise RuntimeError(f"Non-finite decoded video for {name}")
+        save_decoded(output_dir / f"{name}.mp4", decoded, fps)
+        del difference, decoded
+
+    metadata = {
+        "inputs": {key: str(path) for key, path in paths.items()},
+        "vae_type": args.vae_type,
+        "vae_checkpoint": str(checkpoint),
+        "fps": fps,
+        "original_shape_THWC": reference_shape,
+        "latent_shape_CTHW": list(latents["A"].shape),
+        "padding": "Repeat last frame to 4n+1; replicate right/bottom edges to VAE stride.",
+        "operation": "decode(encode(A) - encode(B)) using Wan normalized latents",
+        "output": "Crop to original F/H/W; map decoder [-1,1] to [0,255]; no audio.",
+    }
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"Done: {output_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--video_tag", required=True, type=file_name)
+    parser.add_argument("--vae_checkpoint", required=True, help="Path to the VAE .pth weights")
+    parser.add_argument("--vae_type", choices=("2.1", "2.2"), default="2.2")
+    parser.add_argument("--device", default="cuda", help="cuda, cuda:0, or cpu")
+    args = parser.parse_args()
+    try:
+        run(args)
+    except (OSError, ValueError, RuntimeError, ImportError) as error:
+        parser.exit(1, f"Error: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
