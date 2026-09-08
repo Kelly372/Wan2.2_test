@@ -261,20 +261,11 @@ def run_vae_diff(args):
     print(f'Done: {output_dir}')
 
 
-def normalize_dark_residual(frames, baseline=127.5):
-    """Keep dark-side magnitude; white background, strongest dark residual black.
-
-    Use one scalar for the entire clip, preserving relative temporal amplitudes.
-    This is intensity selection, not a spatial segmentation mask.
-    """
-    if not 0 < baseline <= 255:
-        raise ValueError('Residual baseline must be in (0, 255].')
-    magnitude = np.maximum(baseline - frames.astype(np.float32), 0)
-    peak = float(magnitude.max())
-    if peak == 0:
-        return (np.full(frames.shape, 255, dtype=np.uint8), peak)
-    normalized = np.rint(255 * (1 - magnitude / peak)).astype(np.uint8)
-    return (normalized, peak)
+def raw_latent_residual(original, first_frame):
+    """Return signed E(A)-E(B), without clipping or re-encoding."""
+    if original.shape != first_frame.shape:
+        raise ValueError('Original and first-frame latent shapes must match.')
+    return original - first_frame
 
 
 def mix_initial_latent(noise, residual, source=None, sigma=None, weight=1.0):
@@ -346,9 +337,6 @@ def run_generation(args):
     output_dir = video_dir / args.video_tag
     source_path = video_dir / f'{args.video_tag}_lowResolution.mp4'
     original, fps = read_rgb_video(source_path)
-    residual, residual_fps = read_rgb_video(output_dir / 'A-B.mp4')
-    if original.shape != residual.shape or not math.isclose(fps, residual_fps, rel_tol=0.0001, abs_tol=0.001):
-        raise ValueError('Original and A-B.mp4 must have matching frame count, dimensions and FPS.')
     count, height, width, _ = original.shape
     first_frame_path = video_dir / f'{args.video_tag}_first_frame.mp4'
     first_frames, first_fps = read_rgb_video(first_frame_path)
@@ -356,11 +344,6 @@ def run_generation(args):
         raise ValueError('First-frame video and original must have matching dimensions, frames and FPS.')
     if height % 2 or width % 2:
         raise ValueError('H.264/yuv420p requires even video dimensions.')
-    normalized, peak = normalize_dark_residual(residual, args.baseline)
-    del residual
-    if peak == 0:
-        raise ValueError('No dark-side residual was found; check A-B.mp4 and --baseline.')
-    write_rgb_video(output_dir / 'diff_normalized.mp4', normalized, count, fps, (width, height))
     cfg = WAN_CONFIGS['ti2v-5B']
     torch.cuda.set_device(args.device_id)
     pipe = WanTI2V(cfg, str(checkpoint), device_id=args.device_id, t5_cpu=True, init_on_cpu=True, convert_model_dtype=True)
@@ -372,12 +355,10 @@ def run_generation(args):
         first_tensor = prepare_tensor(first_frames, alignment).to(pipe.device)
         first_latent = pipe.vae.encode([first_tensor])[0].cpu()
         del first_tensor, first_frames
-        residual_tensor = prepare_tensor(normalized, alignment).to(pipe.device)
-        residual_latent = pipe.vae.encode([residual_tensor])[0].cpu()
-        del residual_tensor, normalized
+        residual_latent = raw_latent_residual(source_latent, first_latent)
         if not all(torch.isfinite(v).all() for v in (source_latent, first_latent, residual_latent)):
             raise RuntimeError('VAE produced non-finite latent values.')
-        save_latent(output_dir / 'diff_normalized.pt', residual_latent)
+        save_latent(output_dir / 'residual_raw.pt', residual_latent)
         pipe.vae.model.cpu()
         torch.cuda.empty_cache()
         context = [v.to(pipe.device) for v in pipe.text_encoder([args.prompt], torch.device('cpu'))]
@@ -411,7 +392,7 @@ def run_generation(args):
             pipe.vae.model.cpu()
             torch.cuda.empty_cache()
             branch_info[filename] = {'branch': branch, 'residual_weight': weight, 'start_index': start, 'sigma': sigma, 'steps': len(scheduler.timesteps[start:]), 'seed': args.seed}
-    metadata = {'model': 'ti2v-5B', 'checkpoint': str(checkpoint), 'seed': args.seed, 'source_video': str(source_path), 'prompt': args.prompt, 'negative_prompt': pipe.sample_neg_prompt, 'solver': 'unipc', 'inference_step': args.inference_step, 'shift': cfg.sample_shift, 'guide_scale': cfg.sample_guide_scale, 'strength': args.strength, 'branches': branch_info, 'normalization': 'u=max(baseline-RGB,0); image=255*(1-u/global_max(u))', 'baseline': args.baseline, 'dark_peak': peak, 'injection': 'once before denoising; first frame plus residual, original minus residual; magnitudes 0, 0.1, 0.3, 1', 'first_frame_plus_diff': '(1-sigma)*E(first_frame) + sigma*noise + w*E(normalized_diff)', 'origin_minus_diff': '(1-sigma)*E(original) + sigma*noise - w*E(normalized_diff)', 'first_frame_video': str(first_frame_path), 'latent_shape': list(source_latent.shape), 'fps': fps, 'original_shape': [count, height, width, 3]}
+    metadata = {'model': 'ti2v-5B', 'checkpoint': str(checkpoint), 'seed': args.seed, 'source_video': str(source_path), 'prompt': args.prompt, 'negative_prompt': pipe.sample_neg_prompt, 'solver': 'unipc', 'inference_step': args.inference_step, 'shift': cfg.sample_shift, 'guide_scale': cfg.sample_guide_scale, 'strength': args.strength, 'branches': branch_info, 'residual': 'E(original)-E(first_frame), signed native Wan latent difference; no extra normalization or re-encoding', 'injection': 'once before denoising; first frame plus residual, original minus residual; magnitudes 0, 0.1, 0.3, 1', 'first_frame_plus_diff': '(1-sigma)*E(first_frame) + sigma*noise + w*(E(original)-E(first_frame))', 'origin_minus_diff': '(1-sigma)*E(original) + sigma*noise - w*(E(original)-E(first_frame))', 'first_frame_video': str(first_frame_path), 'latent_shape': list(source_latent.shape), 'fps': fps, 'original_shape': [count, height, width, 3]}
     (output_dir / 'generation_metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print(f'Done: {output_dir}')
 
@@ -438,10 +419,10 @@ def run_pipeline(model_path, video_tag):
     # the full generation pipeline (T5, DiT and VAE).
     gc.collect()
     torch.cuda.empty_cache()
-    print("[3/3] Normalize the dark residual and run the weight comparisons", flush=True)
+    print("[3/3] Use the raw latent residual and run the weight comparisons", flush=True)
     run_generation(argparse.Namespace(
         video_tag=video_tag, model_path=str(checkpoint), inference_step=50,
-        strength=0.5, seed=42, prompt="", baseline=127.5, device_id=0,
+        strength=0.5, seed=42, prompt="", device_id=0,
     ))
 
 

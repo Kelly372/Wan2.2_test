@@ -1,10 +1,10 @@
-"""CPU checks for residual normalization and experiment initialization."""
+"""CPU checks for raw residual and experiment initialization."""
 
 import unittest
 
 import numpy as np
 
-from run_diff_video import generation_experiments, mix_initial_latent, normalize_dark_residual
+from run_diff_video import generation_experiments, mix_initial_latent, raw_latent_residual
 
 
 class DiffGenerationTests(unittest.TestCase):
@@ -42,17 +42,18 @@ class DiffGenerationTests(unittest.TestCase):
         np.testing.assert_allclose(mix_initial_latent(noise, residual, first, 0.25, weight=1), 6.5)
         np.testing.assert_allclose(mix_initial_latent(noise, residual, original, 0.25, weight=-1), 5.0)
 
-    def test_dark_side_and_shared_temporal_scale(self):
-        # Equal channel values make this a grayscale example over two frames.
-        frames = np.array([0, 128, 255, 64, 128, 255], dtype=np.uint8).reshape(2, 1, 1, 3)
-        result, peak = normalize_dark_residual(frames, baseline=128)
-        np.testing.assert_array_equal(result.reshape(-1), [0, 255, 255, 128, 255, 255])
-        self.assertEqual(peak, 128)
+    def test_raw_residual_retains_both_signs_and_clean_latent_identities(self):
+        original = np.array([1., -3., 7.])
+        first = np.array([2., 4., -1.])
+        residual = raw_latent_residual(original, first)
+        np.testing.assert_array_equal(residual, [-1., -7., 8.])
+        np.testing.assert_array_equal(first + residual, original)
+        np.testing.assert_array_equal(original - residual, first)
+        np.testing.assert_array_equal(raw_latent_residual(first, first), np.zeros_like(first))
 
-    def test_no_dark_residual_is_finite_white(self):
-        result, peak = normalize_dark_residual(np.full((2, 2, 2, 3), 255, dtype=np.uint8))
-        self.assertTrue((result == 255).all())
-        self.assertEqual(peak, 0)
+    def test_raw_residual_rejects_broadcasting(self):
+        with self.assertRaises(ValueError):
+            raw_latent_residual(np.zeros((2, 3)), np.zeros((1, 3)))
 
     def test_random_and_conditioned_addition(self):
         noise = np.full((2, 3, 4, 4), 2.0)

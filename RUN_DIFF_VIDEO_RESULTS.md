@@ -26,8 +26,7 @@ python run_diff_video.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
 | `A_reconstruction.mp4` | `decode(encode(A))`：判断正常动态视频的 VAE 重建是否闪烁。 |
 | `B_reconstruction.mp4` | `decode(encode(B))`：判断静态首帧视频的 VAE 重建是否产生时间变化。 |
 | `A-B.mp4` | `decode(encode(A) - encode(B))`，用于观察 latent 差值的解码效果。 |
-| `diff_normalized.mp4` | 保留 A-B 视频中比中灰更暗的残差；灰色及亮侧变为白色，暗侧轮廓按整段视频的统一尺度归一化。 |
-| `diff_normalized.pt` | 归一化残差图像的 VAE latent，从压缩前的图像直接编码。 |
+| `residual_raw.pt` | 原始有符号 latent 残差 `E(A)-E(B)`，直接用于后续加减，不做暗侧归一化或解码后重新编码。 |
 | `first_frame_plus_diff_w0.mp4` | 首帧视频加噪后去噪，不注入残差。 |
 | `first_frame_plus_diff_w0.1.mp4`、`first_frame_plus_diff_w0.3.mp4`、`first_frame_plus_diff_w1.mp4` | 首帧视频加噪后，分别加上 0.1、0.3、1 倍残差 latent，再去噪。 |
 | `origin_minus_diff_w0.mp4` | 原视频加噪后去噪，不注入残差。 |
@@ -37,10 +36,10 @@ python run_diff_video.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
 
 两组对照共享同一份随机噪声、种子、提示词和加噪强度。初始化分别为：
 
-- 首帧加残差：`(1-σ)*E(B) + σ*ε + w*E(R)`。
-- 原视频减残差：`(1-σ)*E(A) + σ*ε - w*E(R)`。
+- 首帧加残差：`(1-σ)*E(B) + σ*ε + w*(E(A)-E(B))`。
+- 原视频减残差：`(1-σ)*E(A) + σ*ε - w*(E(A)-E(B))`。
 
-R 仍为暗侧归一化后的残差视频。每组权重 w 为 0、0.1、0.3、1，在去噪前各注入一次。默认均从 50 步日程的中间开始，运行后 25 步；每次重新创建调度器，共生成 8 个对照视频。参数记录在 `generation_metadata.json`，其中 `residual_weight` 使用带正负号的实际系数。
+残差直接由同一个 VAE 编码的 A/B latent 相减，保留正负值；不再读取 A-B.mp4 作为生成输入，该视频仅用于可视化。每组权重 w 为 0、0.1、0.3、1，在去噪前各注入一次。默认均从 50 步日程的中间开始，运行后 25 步；每次重新创建调度器，共生成 8 个对照视频。参数记录在 `generation_metadata.json`，其中 `residual_weight` 使用带正负号的实际系数。
 
 旧的 `condition_noise_with_diff.mp4` 和随机噪声分支不再生成；已有旧文件不会自动删除，比较时请使用上述新文件名。
 
@@ -51,9 +50,9 @@ R 仍为暗侧归一化后的残差视频。每组权重 w 为 0、0.1、0.3、1
 ## 如何理解画面
 
 - `A-B.mp4` 可能出现灰色背景、固定首帧残影和移动轮廓；latent 差值解码不等于像素相减，也不是前景分割。
-- `diff_normalized.mp4` 只按明暗保留单侧残差，没有透明通道；无法保证去掉同属暗侧的首帧残影。
+- 原始残差包含正、负两个方向，不进行截断。旧的 `diff_normalized.mp4/.pt` 不再生成或读取，已有文件不会自动删除。
 - 两组最终视频用于比较首帧加残差与原视频减残差的生成效果。直接相加的残差 latent 不等于纯运动特征，不能保证准确复现原运动。
 
 重新运行会覆盖对应结果文件。将示例中的 `clip` 替换为实际 `video_tag` 即可对应自己的输出。
 
-注意：E(R) 是经过解码、单向归一化、再次编码后的表示，并不等于 E(A)-E(B)，所以首帧加残差不保证还原 A，原视频减残差也不保证还原 B。
+注意：干净 latent 上有 `E(B)+(E(A)-E(B))=E(A)` 和 `E(A)-(E(A)-E(B))=E(B)`。当前仍在基础视频加噪后注入未缩放的残差，因此带噪初始化不等同于另一视频的标准加噪版本；保留这一设置用于和之前的实验对照。
