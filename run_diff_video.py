@@ -237,21 +237,25 @@ def run_vae_diff(args):
                 raise RuntimeError(f'Non-finite latent for {label}')
             latents[label] = latent
             save_latent(output_dir / f'{path.stem}.pt', latent)
-        name = 'A-B'
-        print(f'Decoding {name}', flush=True)
-        difference = latents['A'] - latents['B']
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-            free, total = torch.cuda.mem_get_info(device)
-            print(f'GPU={torch.cuda.get_device_name(device)}, latent={tuple(difference.shape)}, free VRAM={free / 2 ** 30:.2f}/{total / 2 ** 30:.2f} GiB', flush=True)
-        decoded = vae.decode([difference.to(device)])[0]
-        if decoded.shape[1] < count or decoded.shape[2] < height or decoded.shape[3] < width:
-            raise RuntimeError(f'Decoded {name} is smaller than the original video.')
-        decoded = decoded[:, :count, :height, :width]
-        if not torch.isfinite(decoded).all():
-            raise RuntimeError(f'Non-finite decoded video for {name}')
-        save_decoded(output_dir / f'{name}.mp4', decoded, fps)
-        del difference, decoded
+        reconstructions = (
+            ('A_reconstruction', latents['A']),
+            ('B_reconstruction', latents['B']),
+            ('A-B', latents['A'] - latents['B']),
+        )
+        for name, latent_to_decode in reconstructions:
+            print(f'Decoding {name}', flush=True)
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                free, total = torch.cuda.mem_get_info(device)
+                print(f'latent={tuple(latent_to_decode.shape)}, free VRAM={free / 2**30:.2f}/{total / 2**30:.2f} GiB', flush=True)
+            decoded = vae.decode([latent_to_decode.to(device)])[0]
+            decoded = decoded[:, :count, :height, :width]
+            if tuple(decoded.shape) != (3, count, height, width):
+                raise RuntimeError(f'Invalid decoded shape for {name}: {tuple(decoded.shape)}')
+            if not torch.isfinite(decoded).all():
+                raise RuntimeError(f'Non-finite decoded video for {name}')
+            save_decoded(output_dir / f'{name}.mp4', decoded, fps)
+            del decoded
     metadata = {'inputs': {key: str(path) for key, path in paths.items()}, 'vae_type': args.vae_type, 'vae_checkpoint': str(checkpoint), 'vae_dtype': args.vae_dtype, 'cudnn_enabled': torch.backends.cudnn.enabled, 'fps': fps, 'original_shape_THWC': reference_shape, 'latent_shape_CTHW': list(latents['A'].shape), 'padding': 'Repeat last frame to 4n+1; replicate right/bottom edges to VAE stride.', 'operation': 'decode(encode(A) - encode(B)) using Wan normalized latents', 'output': 'Crop to original F/H/W; map decoder [-1,1] to [0,255]; no audio.', 'video_encoding': 'H.264 (libx264), yuv420p, CRF 18, faststart'}
     (output_dir / 'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print(f'Done: {output_dir}')
@@ -273,15 +277,30 @@ def normalize_dark_residual(frames, baseline=127.5):
     return (normalized, peak)
 
 
-def mix_initial_latent(noise, residual, source=None, sigma=None):
-    """Add the residual exactly once, without concatenation or amplitude scaling."""
+def mix_initial_latent(noise, residual, source=None, sigma=None, weight=1.0):
+    """Add a weighted residual once; weight zero omits residual injection entirely."""
     if noise.shape != residual.shape or (source is not None and source.shape != noise.shape):
         raise ValueError('All latent shapes must match for elementwise addition.')
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError('Residual weight must be finite and nonnegative.')
     if source is None:
-        return noise + residual
-    if sigma is None or not 0 <= sigma <= 1:
-        raise ValueError('Conditioned initialization needs sigma in [0, 1].')
-    return (1 - sigma) * source + sigma * noise + residual
+        base = noise.clone() if hasattr(noise, 'clone') else noise.copy()
+    else:
+        if sigma is None or not 0 <= sigma <= 1:
+            raise ValueError('Conditioned initialization needs sigma in [0, 1].')
+        base = (1 - sigma) * source + sigma * noise
+    return base if weight == 0 else base + weight * residual
+
+
+def generation_experiments():
+    """Independent runs; weight=1 retains the original output filename."""
+    return (
+        ('condition', 0.0, 'condition_noise_without_diff.mp4'),
+        ('condition', 0.1, 'condition_noise_with_diff_w0.1.mp4'),
+        ('condition', 0.3, 'condition_noise_with_diff_w0.3.mp4'),
+        ('condition', 1.0, 'condition_noise_with_diff.mp4'),
+        ('random', 1.0, 'random_noise_with_diff.mp4'),
+    )
 
 
 def resolve_checkpoint(value):
@@ -362,15 +381,15 @@ def run_generation(args):
         source_latent = source_latent.to(pipe.device)
         residual_latent = residual_latent.to(pipe.device)
         branch_info = {}
-        for branch in ('condition', 'random'):
+        for branch, weight, filename in generation_experiments():
             scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=cfg.num_train_timesteps, shift=1, use_dynamic_shifting=False)
             scheduler.set_timesteps(args.inference_step, device=pipe.device, shift=cfg.sample_shift)
             start = 0 if branch == 'random' else args.inference_step - max(1, int(args.inference_step * args.strength))
             scheduler.set_begin_index(start)
             sigma = float(scheduler.sigmas[start])
-            initial = mix_initial_latent(noise, residual_latent, source=source_latent if branch == 'condition' else None, sigma=sigma if branch == 'condition' else None)
+            initial = mix_initial_latent(noise, residual_latent, source=source_latent if branch == 'condition' else None, sigma=sigma if branch == 'condition' else None, weight=weight)
             pipe.model.to(pipe.device)
-            print(f'{branch}: {len(scheduler.timesteps[start:])} steps, start sigma={sigma:g}', flush=True)
+            print(f'{branch}, weight={weight:g}: {len(scheduler.timesteps[start:])} steps, start sigma={sigma:g}', flush=True)
             result = denoise(pipe, scheduler, initial, scheduler.timesteps[start:], context, context_null, cfg.sample_guide_scale)
             del initial
             pipe.model.cpu()
@@ -379,12 +398,12 @@ def run_generation(args):
             decoded = pipe.vae.decode([result])[0][:, :count, :height, :width]
             if tuple(decoded.shape) != (3, count, height, width) or not torch.isfinite(decoded).all():
                 raise RuntimeError('Invalid decoded output shape or values.')
-            save_decoded(output_dir / f'{branch}_noise_with_diff.mp4', decoded, fps)
+            save_decoded(output_dir / filename, decoded, fps)
             del result, decoded
             pipe.vae.model.cpu()
             torch.cuda.empty_cache()
-            branch_info[branch] = {'start_index': start, 'sigma': sigma, 'steps': len(scheduler.timesteps[start:])}
-    metadata = {'model': 'ti2v-5B', 'checkpoint': str(checkpoint), 'seed': args.seed, 'source_video': str(source_path), 'prompt': args.prompt, 'negative_prompt': pipe.sample_neg_prompt, 'solver': 'unipc', 'inference_step': args.inference_step, 'shift': cfg.sample_shift, 'guide_scale': cfg.sample_guide_scale, 'strength': args.strength, 'branches': branch_info, 'normalization': 'u=max(baseline-RGB,0); image=255*(1-u/global_max(u))', 'baseline': args.baseline, 'dark_peak': peak, 'injection': 'once before denoising; elementwise addition with weight 1', 'random': 'noise + E(normalized_diff)', 'condition': '(1-sigma)*E(original) + sigma*noise + E(normalized_diff)', 'latent_shape': list(source_latent.shape), 'fps': fps, 'original_shape': [count, height, width, 3]}
+            branch_info[filename] = {'branch': branch, 'residual_weight': weight, 'start_index': start, 'sigma': sigma, 'steps': len(scheduler.timesteps[start:]), 'seed': args.seed}
+    metadata = {'model': 'ti2v-5B', 'checkpoint': str(checkpoint), 'seed': args.seed, 'source_video': str(source_path), 'prompt': args.prompt, 'negative_prompt': pipe.sample_neg_prompt, 'solver': 'unipc', 'inference_step': args.inference_step, 'shift': cfg.sample_shift, 'guide_scale': cfg.sample_guide_scale, 'strength': args.strength, 'branches': branch_info, 'normalization': 'u=max(baseline-RGB,0); image=255*(1-u/global_max(u))', 'baseline': args.baseline, 'dark_peak': peak, 'injection': 'once before denoising; condition weights 0, 0.1, 0.3, 1; random weight 1', 'random': 'noise + E(normalized_diff)', 'condition': '(1-sigma)*E(original) + sigma*noise + weight*E(normalized_diff)', 'latent_shape': list(source_latent.shape), 'fps': fps, 'original_shape': [count, height, width, 3]}
     (output_dir / 'generation_metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print(f'Done: {output_dir}')
 
@@ -402,7 +421,7 @@ def run_pipeline(model_path, video_tag):
         video_dir / f"{video_tag}_lowResolution.mp4",
         video_dir / f"{video_tag}_first_frame.mp4",
     )
-    print("[2/3] Encode A/B and decode the latent difference", flush=True)
+    print("[2/3] Reconstruct A/B and decode the latent difference", flush=True)
     run_vae_diff(argparse.Namespace(
         video_tag=video_tag, vae_checkpoint=str(checkpoint / "Wan2.2_VAE.pth"),
         vae_type="2.2", device="cuda:0", vae_dtype="float32", disable_cudnn=False,
@@ -411,7 +430,7 @@ def run_pipeline(model_path, video_tag):
     # the full generation pipeline (T5, DiT and VAE).
     gc.collect()
     torch.cuda.empty_cache()
-    print("[3/3] Normalize the dark residual and generate both videos", flush=True)
+    print("[3/3] Normalize the dark residual and run the weight comparisons", flush=True)
     run_generation(argparse.Namespace(
         video_tag=video_tag, model_path=str(checkpoint), inference_step=50,
         strength=0.5, seed=42, prompt="", baseline=127.5, device_id=0,
