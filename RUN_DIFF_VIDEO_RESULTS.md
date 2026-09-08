@@ -28,17 +28,21 @@ python run_diff_video.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
 | `A-B.mp4` | `decode(encode(A) - encode(B))`，用于观察 latent 差值的解码效果。 |
 | `diff_normalized.mp4` | 保留 A-B 视频中比中灰更暗的残差；灰色及亮侧变为白色，暗侧轮廓按整段视频的统一尺度归一化。 |
 | `diff_normalized.pt` | 归一化残差图像的 VAE latent，从压缩前的图像直接编码。 |
-| `random_noise_with_diff.mp4` | 随机噪声加上归一化残差 latent，再去噪生成。 |
-| `condition_noise_with_diff.mp4` | A 的 latent 加噪后，再加上归一化残差 latent，随后去噪生成。 |
-| `condition_noise_without_diff.mp4` | 残差权重 0：原视频加噪后直接去噪，作为无残差基线。 |
-| `condition_noise_with_diff_w0.1.mp4` | 残差权重 0.1 的条件去噪结果。 |
-| `condition_noise_with_diff_w0.3.mp4` | 残差权重 0.3 的条件去噪结果。 |
+| `first_frame_plus_diff_w0.mp4` | 首帧视频加噪后去噪，不注入残差。 |
+| `first_frame_plus_diff_w0.1.mp4`、`first_frame_plus_diff_w0.3.mp4`、`first_frame_plus_diff_w1.mp4` | 首帧视频加噪后，分别加上 0.1、0.3、1 倍残差 latent，再去噪。 |
+| `origin_minus_diff_w0.mp4` | 原视频加噪后去噪，不注入残差。 |
+| `origin_minus_diff_w0.1.mp4`、`origin_minus_diff_w0.3.mp4`、`origin_minus_diff_w1.mp4` | 原视频加噪后，分别减去 0.1、0.3、1 倍残差 latent，再去噪。 |
 | `metadata.json` | A/B 的路径、VAE 配置、尺寸、帧率和 latent 形状。 |
 | `generation_metadata.json` | 生成参数、两路初始化公式、实际去噪步数和噪声强度。 |
 
-两路使用同一份随机噪声，并在去噪前各执行一次逐元素加法。默认随机分支运行 50 步；原视频分支从日程中间开始，运行后 25 步，以保留部分原视频信息。
+两组对照共享同一份随机噪声、种子、提示词和加噪强度。初始化分别为：
 
-条件分支现默认执行四个独立对照，初始化为 `(1-σ)*z_A + σ*ε + w*z_R`，`w` 分别为 0、0.1、0.3、1。四次使用同一份噪声、种子、提示词、加噪强度和 25 步去噪日程，每次重新创建调度器。`w=0` 完全跳过残差注入；`w=1` 沿用 `condition_noise_with_diff.mp4` 文件名。各权重和实际日程记录在 `generation_metadata.json` 中。新增对照会增加运行时间。
+- 首帧加残差：`(1-σ)*E(B) + σ*ε + w*E(R)`。
+- 原视频减残差：`(1-σ)*E(A) + σ*ε - w*E(R)`。
+
+R 仍为暗侧归一化后的残差视频。每组权重 w 为 0、0.1、0.3、1，在去噪前各注入一次。默认均从 50 步日程的中间开始，运行后 25 步；每次重新创建调度器，共生成 8 个对照视频。参数记录在 `generation_metadata.json`，其中 `residual_weight` 使用带正负号的实际系数。
+
+旧的 `condition_noise_with_diff.mp4` 和随机噪声分支不再生成；已有旧文件不会自动删除，比较时请使用上述新文件名。
 
 建议依次检查 A 重建、B 重建、权重 0 的基线，再对比 0.1/0.3/1。如果重建和基线稳定，而闪烁随权重增强，更支持残差注入导致或放大闪烁；如果正常重建已经闪烁，应先排查 VAE 阶段。不同内容的生成结果不能仅凭亮度变化就认定为异常，需结合运动观察。
 
@@ -48,6 +52,8 @@ python run_diff_video.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
 
 - `A-B.mp4` 可能出现灰色背景、固定首帧残影和移动轮廓；latent 差值解码不等于像素相减，也不是前景分割。
 - `diff_normalized.mp4` 只按明暗保留单侧残差，没有透明通道；无法保证去掉同属暗侧的首帧残影。
-- 两路最终视频用于比较原视频初始化和随机初始化下的生成效果。直接相加的残差 latent 不等于纯运动特征，不能保证准确复现原运动。
+- 两组最终视频用于比较首帧加残差与原视频减残差的生成效果。直接相加的残差 latent 不等于纯运动特征，不能保证准确复现原运动。
 
 重新运行会覆盖对应结果文件。将示例中的 `clip` 替换为实际 `video_tag` 即可对应自己的输出。
+
+注意：E(R) 是经过解码、单向归一化、再次编码后的表示，并不等于 E(A)-E(B)，所以首帧加残差不保证还原 A，原视频减残差也不保证还原 B。

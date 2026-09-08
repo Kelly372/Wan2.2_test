@@ -30,9 +30,17 @@ class DiffGenerationTests(unittest.TestCase):
 
     def test_comparison_outputs_are_complete_and_unique(self):
         experiments = generation_experiments()
-        self.assertEqual([weight for branch, weight, _ in experiments if branch == 'condition'], [0, 0.1, 0.3, 1])
-        self.assertEqual(len({filename for _, _, filename in experiments}), len(experiments))
-        self.assertIn(('condition', 1.0, 'condition_noise_with_diff.mp4'), experiments)
+        self.assertEqual([w for branch, w, _ in experiments if branch == 'first_frame_plus_diff'], [0, 0.1, 0.3, 1])
+        self.assertEqual([w for branch, w, _ in experiments if branch == 'origin_minus_diff'], [0, -0.1, -0.3, -1])
+        self.assertEqual(len({name for _, _, name in experiments}), 8)
+
+    def test_original_subtraction_and_first_frame_addition(self):
+        noise = np.full((1, 2, 2, 2), 2.0)
+        original = np.full_like(noise, 10.0)
+        first = np.full_like(noise, 4.0)
+        residual = np.full_like(noise, 3.0)
+        np.testing.assert_allclose(mix_initial_latent(noise, residual, first, 0.25, weight=1), 6.5)
+        np.testing.assert_allclose(mix_initial_latent(noise, residual, original, 0.25, weight=-1), 5.0)
 
     def test_dark_side_and_shared_temporal_scale(self):
         # Equal channel values make this a grayscale example over two frames.

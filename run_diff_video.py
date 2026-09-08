@@ -281,8 +281,8 @@ def mix_initial_latent(noise, residual, source=None, sigma=None, weight=1.0):
     """Add a weighted residual once; weight zero omits residual injection entirely."""
     if noise.shape != residual.shape or (source is not None and source.shape != noise.shape):
         raise ValueError('All latent shapes must match for elementwise addition.')
-    if not math.isfinite(weight) or weight < 0:
-        raise ValueError('Residual weight must be finite and nonnegative.')
+    if not math.isfinite(weight):
+        raise ValueError('Residual weight must be finite.')
     if source is None:
         base = noise.clone() if hasattr(noise, 'clone') else noise.copy()
     else:
@@ -293,14 +293,13 @@ def mix_initial_latent(noise, residual, source=None, sigma=None, weight=1.0):
 
 
 def generation_experiments():
-    """Independent runs; weight=1 retains the original output filename."""
-    return (
-        ('condition', 0.0, 'condition_noise_without_diff.mp4'),
-        ('condition', 0.1, 'condition_noise_with_diff_w0.1.mp4'),
-        ('condition', 0.3, 'condition_noise_with_diff_w0.3.mp4'),
-        ('condition', 1.0, 'condition_noise_with_diff.mp4'),
-        ('random', 1.0, 'random_noise_with_diff.mp4'),
+    """Two source/sign comparisons, each with a zero-weight baseline."""
+    return tuple(
+        (branch, sign * weight, f'{branch}_w{weight:g}.mp4')
+        for branch, sign in (('first_frame_plus_diff', 1), ('origin_minus_diff', -1))
+        for weight in (0, 0.1, 0.3, 1)
     )
+
 
 
 def resolve_checkpoint(value):
@@ -351,6 +350,10 @@ def run_generation(args):
     if original.shape != residual.shape or not math.isclose(fps, residual_fps, rel_tol=0.0001, abs_tol=0.001):
         raise ValueError('Original and A-B.mp4 must have matching frame count, dimensions and FPS.')
     count, height, width, _ = original.shape
+    first_frame_path = video_dir / f'{args.video_tag}_first_frame.mp4'
+    first_frames, first_fps = read_rgb_video(first_frame_path)
+    if first_frames.shape != original.shape or not math.isclose(fps, first_fps, rel_tol=1e-4, abs_tol=1e-3):
+        raise ValueError('First-frame video and original must have matching dimensions, frames and FPS.')
     if height % 2 or width % 2:
         raise ValueError('H.264/yuv420p requires even video dimensions.')
     normalized, peak = normalize_dark_residual(residual, args.baseline)
@@ -366,10 +369,13 @@ def run_generation(args):
         original_tensor = prepare_tensor(original, alignment).to(pipe.device)
         source_latent = pipe.vae.encode([original_tensor])[0].cpu()
         del original_tensor, original
+        first_tensor = prepare_tensor(first_frames, alignment).to(pipe.device)
+        first_latent = pipe.vae.encode([first_tensor])[0].cpu()
+        del first_tensor, first_frames
         residual_tensor = prepare_tensor(normalized, alignment).to(pipe.device)
         residual_latent = pipe.vae.encode([residual_tensor])[0].cpu()
         del residual_tensor, normalized
-        if not torch.isfinite(source_latent).all() or not torch.isfinite(residual_latent).all():
+        if not all(torch.isfinite(v).all() for v in (source_latent, first_latent, residual_latent)):
             raise RuntimeError('VAE produced non-finite latent values.')
         save_latent(output_dir / 'diff_normalized.pt', residual_latent)
         pipe.vae.model.cpu()
@@ -379,15 +385,17 @@ def run_generation(args):
         generator = torch.Generator(device=pipe.device).manual_seed(args.seed)
         noise = torch.randn(source_latent.shape, device=pipe.device, dtype=torch.float32, generator=generator)
         source_latent = source_latent.to(pipe.device)
+        first_latent = first_latent.to(pipe.device)
         residual_latent = residual_latent.to(pipe.device)
         branch_info = {}
         for branch, weight, filename in generation_experiments():
             scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=cfg.num_train_timesteps, shift=1, use_dynamic_shifting=False)
             scheduler.set_timesteps(args.inference_step, device=pipe.device, shift=cfg.sample_shift)
-            start = 0 if branch == 'random' else args.inference_step - max(1, int(args.inference_step * args.strength))
+            start = args.inference_step - max(1, int(args.inference_step * args.strength))
             scheduler.set_begin_index(start)
             sigma = float(scheduler.sigmas[start])
-            initial = mix_initial_latent(noise, residual_latent, source=source_latent if branch == 'condition' else None, sigma=sigma if branch == 'condition' else None, weight=weight)
+            base_latent = first_latent if branch == 'first_frame_plus_diff' else source_latent
+            initial = mix_initial_latent(noise, residual_latent, source=base_latent, sigma=sigma, weight=weight)
             pipe.model.to(pipe.device)
             print(f'{branch}, weight={weight:g}: {len(scheduler.timesteps[start:])} steps, start sigma={sigma:g}', flush=True)
             result = denoise(pipe, scheduler, initial, scheduler.timesteps[start:], context, context_null, cfg.sample_guide_scale)
@@ -403,7 +411,7 @@ def run_generation(args):
             pipe.vae.model.cpu()
             torch.cuda.empty_cache()
             branch_info[filename] = {'branch': branch, 'residual_weight': weight, 'start_index': start, 'sigma': sigma, 'steps': len(scheduler.timesteps[start:]), 'seed': args.seed}
-    metadata = {'model': 'ti2v-5B', 'checkpoint': str(checkpoint), 'seed': args.seed, 'source_video': str(source_path), 'prompt': args.prompt, 'negative_prompt': pipe.sample_neg_prompt, 'solver': 'unipc', 'inference_step': args.inference_step, 'shift': cfg.sample_shift, 'guide_scale': cfg.sample_guide_scale, 'strength': args.strength, 'branches': branch_info, 'normalization': 'u=max(baseline-RGB,0); image=255*(1-u/global_max(u))', 'baseline': args.baseline, 'dark_peak': peak, 'injection': 'once before denoising; condition weights 0, 0.1, 0.3, 1; random weight 1', 'random': 'noise + E(normalized_diff)', 'condition': '(1-sigma)*E(original) + sigma*noise + weight*E(normalized_diff)', 'latent_shape': list(source_latent.shape), 'fps': fps, 'original_shape': [count, height, width, 3]}
+    metadata = {'model': 'ti2v-5B', 'checkpoint': str(checkpoint), 'seed': args.seed, 'source_video': str(source_path), 'prompt': args.prompt, 'negative_prompt': pipe.sample_neg_prompt, 'solver': 'unipc', 'inference_step': args.inference_step, 'shift': cfg.sample_shift, 'guide_scale': cfg.sample_guide_scale, 'strength': args.strength, 'branches': branch_info, 'normalization': 'u=max(baseline-RGB,0); image=255*(1-u/global_max(u))', 'baseline': args.baseline, 'dark_peak': peak, 'injection': 'once before denoising; first frame plus residual, original minus residual; magnitudes 0, 0.1, 0.3, 1', 'first_frame_plus_diff': '(1-sigma)*E(first_frame) + sigma*noise + w*E(normalized_diff)', 'origin_minus_diff': '(1-sigma)*E(original) + sigma*noise - w*E(normalized_diff)', 'first_frame_video': str(first_frame_path), 'latent_shape': list(source_latent.shape), 'fps': fps, 'original_shape': [count, height, width, 3]}
     (output_dir / 'generation_metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print(f'Done: {output_dir}')
 
