@@ -48,7 +48,7 @@ def prepare_tensor(frames, stride):
     return functional.pad(video.unsqueeze(0), padding, mode="replicate")[0]
 
 
-def load_vae(checkpoint, version, device):
+def load_vae(checkpoint, version, device, dtype=None):
     import torch
 
     # Load only the standalone VAE, avoiding wan.__init__ and diffusion models.
@@ -58,7 +58,10 @@ def load_vae(checkpoint, version, device):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     vae_class = getattr(module, f"Wan{suffix}_VAE")
-    return vae_class(vae_pth=str(checkpoint), device=device, dtype=torch.float32)
+    return vae_class(
+        vae_pth=str(checkpoint), device=device,
+        dtype=torch.float32 if dtype is None else dtype,
+    )
 
 
 def save_latent(path, tensor):
@@ -95,6 +98,22 @@ def run(args):
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA is unavailable. Use --device cpu or install CUDA-enabled PyTorch.")
+    if device.type == "cuda":
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        torch.cuda.set_device(device)
+    if args.disable_cudnn:
+        torch.backends.cudnn.enabled = False
+    dtype = getattr(torch, args.vae_dtype)
+    if device.type != "cuda" and dtype != torch.float32:
+        raise ValueError("Use --vae_dtype float32 for CPU execution.")
+    if device.type == "cuda" and dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise ValueError("This GPU does not support bfloat16; use float32 or float16.")
+    print(
+        f"PyTorch={torch.__version__}, CUDA={torch.version.cuda}, "
+        f"cuDNN={torch.backends.cudnn.version()}, cuDNN enabled={torch.backends.cudnn.enabled}, "
+        f"VAE dtype={args.vae_dtype}, device={device}", flush=True,
+    )
     video_dir = DATA_DIR / "video"
     paths = {
         "A": video_dir / f"{args.video_tag}.mp4",
@@ -121,7 +140,7 @@ def run(args):
 
     output_dir = video_dir / args.video_tag
     output_dir.mkdir(parents=True, exist_ok=True)
-    vae = load_vae(checkpoint, args.vae_type, device)
+    vae = load_vae(checkpoint, args.vae_type, device, dtype=dtype)
     stride = 16 if args.vae_type == "2.2" else 8
     latents = {}
     with torch.inference_mode():
@@ -140,6 +159,15 @@ def run(args):
         name = "A-B"
         print(f"Decoding {name}", flush=True)
         difference = latents["A"] - latents["B"]
+        if device.type == "cuda":
+            # Release unused allocator blocks left by encoding. This does not
+            # free live tensors or guarantee enough workspace for decoding.
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info(device)
+            print(
+                f"GPU={torch.cuda.get_device_name(device)}, latent={tuple(difference.shape)}, "
+                f"free VRAM={free / 2**30:.2f}/{total / 2**30:.2f} GiB", flush=True,
+            )
         decoded = vae.decode([difference.to(device)])[0]
         if decoded.shape[1] < count or decoded.shape[2] < height or decoded.shape[3] < width:
             raise RuntimeError(f"Decoded {name} is smaller than the original video.")
@@ -153,6 +181,8 @@ def run(args):
         "inputs": {key: str(path) for key, path in paths.items()},
         "vae_type": args.vae_type,
         "vae_checkpoint": str(checkpoint),
+        "vae_dtype": args.vae_dtype,
+        "cudnn_enabled": torch.backends.cudnn.enabled,
         "fps": fps,
         "original_shape_THWC": reference_shape,
         "latent_shape_CTHW": list(latents["A"].shape),
@@ -171,10 +201,17 @@ def main():
     parser.add_argument("--vae_checkpoint", required=True, help="Path to the VAE .pth weights")
     parser.add_argument("--vae_type", choices=("2.1", "2.2"), default="2.2")
     parser.add_argument("--device", default="cuda", help="cuda, cuda:0, or cpu")
+    parser.add_argument("--vae_dtype", choices=("float32", "float16", "bfloat16"), default="float32",
+                        help="VAE autocast dtype; lower precision can reduce activation memory on CUDA")
+    parser.add_argument("--disable_cudnn", action="store_true",
+                        help="Use native PyTorch kernels instead of cuDNN (may be slower/use more memory)")
+    parser.add_argument("--debug", action="store_true", help="Show the complete traceback on failure")
     args = parser.parse_args()
     try:
         run(args)
     except (OSError, ValueError, RuntimeError, ImportError) as error:
+        if args.debug:
+            raise
         parser.exit(1, f"Error: {error}\n")
 
 

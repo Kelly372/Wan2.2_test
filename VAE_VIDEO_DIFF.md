@@ -42,6 +42,20 @@ A/B 必须具有相同的帧数、分辨率和帧率，否则脚本报错。重�
 
 这里直接对归一化 latent 相减，再调用仓库的 `decode()`，不额外调整均值或缩放差值。VAE 是非线性的，因此输出是 latent 差值的解码实验，并不等同于像素相减或前景分割。解码器的 `[-1, 1]` 输出线性映射到 `[0, 255]` 后保存。
 
+## VAE 解码报错排查
+
+若在 `Decoding A-B` 出现 `GET was unable to find an engine to execute this computation`，这是 GPU 卷积执行错误，尚未进入 MP4 编码。脚本会打印 PyTorch/CUDA/cuDNN 版本、GPU、latent 形状和解码前可用显存。它也会释放编码阶段留下的空闲显存缓存，但这不会释放仍在使用的张量，不能保证解决显存不足。
+
+保留原命令参数，增加 `--disable_cudnn --debug` 可测试绕过 cuDNN，并保留完整错误堆栈。例如：
+
+```bash
+python vae_video_diff.py --video_tag clip --vae_checkpoint /path/to/Wan2.2_VAE.pth --disable_cudnn --debug
+```
+
+该选项仅用于兼容性排查，可能更慢或使用更多显存。若解码前显存不足，可另行测试 `--vae_dtype bfloat16`（GPU 需支持）或 `--vae_dtype float16`；默认仍为 float32。低精度会改变数值结果，脚本仍检查非有限值。不要同时改变多个选项，以便区分原因。CPU 对照可使用 `--device cpu`，速度较慢且需要足够内存。
+
+若禁用 cuDNN 有效，应结合完整日志检查 PyTorch 自带 cuDNN 与系统加载库是否冲突；不能仅凭这一行错误就判断具体根因。精度和 cuDNN 设置会写入实验元数据。
+
 ## 残差注入去噪生成
 
 完成上述实验、得到 `data/video/clip/A-B.mp4` 后，运行：
