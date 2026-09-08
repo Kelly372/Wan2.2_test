@@ -116,7 +116,7 @@ def run(args):
     )
     video_dir = DATA_DIR / "video"
     paths = {
-        "A": video_dir / f"{args.video_tag}.mp4",
+        "A": video_dir / f"{args.video_tag}_lowResolution.mp4",
         "B": video_dir / f"{args.video_tag}_first_frame.mp4",
     }
     # Validate all inputs before loading the model or writing experiment results.

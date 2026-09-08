@@ -1,6 +1,20 @@
 # 视频 latent 差值实验
 
-将原视频放在 `data/video/clip.mp4`，先生成首帧视频 B，再编码 A/B 并解码差值：
+## 一体化运行（推荐）
+
+`run_video_pipeline.py` 在一个文件中包含预处理、VAE 差值和两路去噪生成，不依赖之前的三个脚本。只需两个参数：
+
+```bash
+python run_video_pipeline.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
+```
+
+输入为 `data/video/clip.mp4`，模型目录必须包含完整 TI2V-5B 权重和 `Wan2.2_VAE.pth`。需要仓库完整推理依赖及 CUDA GPU。流程依次另存 H=384、W=672 的 `clip_lowResolution.mp4`、生成 `clip_first_frame.mp4`、编码 A/B 并解码差值、保留暗侧并归一化、在两路去噪前各加一次残差 latent。各阶段失败时立即停止并显示完整堆栈。
+
+latent、`A-B.mp4`、归一化预览以及最终 `random_noise_with_diff.mp4`、`condition_noise_with_diff.mp4` 均保存到 `data/video/clip/`。原视频保留。默认参数沿用之前的设置：VAE float32、GPU 0、UniPC 50 步日程、原视频分支后 25 步、strength=0.5、seed=42、空提示词。无需单独指定 VAE 权重路径。
+
+以下保留分步运行说明，供单独调试各阶段使用。
+
+将原视频放在 `data/video/clip.mp4`，先另存低分辨率视频 A 并生成首帧视频 B，再编码 A/B 并解码差值：
 
 ```bash
 python prepare_videos.py --video_tag clip
@@ -21,11 +35,11 @@ Linux 环境安装仓库依赖后即可运行。若已有环境缺少编码依�
 
 修改代码不会转换旧视频；重新运行上述两个命令可覆盖生成兼容格式的视频及相应 latent 文件。
 
-所有数据路径相对于脚本所在的仓库根目录。只需要原视频，首帧视频保持原视频的帧数、分辨率和帧率。
+所有数据路径相对于脚本所在的仓库根目录。预处理先打印原视频 F/H/W/FPS，再逐帧缩放到固定 H=384、W=672，保存为 `data/video/clip_lowResolution.mp4`，原文件 `clip.mp4` 保持不变。固定尺寸缩放不裁剪、不加黑边，宽高比不同时会拉伸。帧数和帧率保持不变；首帧视频从保存后的低分辨率视频提取并重复。后续 VAE 和去噪生成统一读取低分辨率视频作为 A。
 
 | 输入 | 保存的 latent |
 | --- | --- |
-| `data/video/clip.mp4`（A） | `data/video/clip/clip.pt` |
+| `data/video/clip_lowResolution.mp4`（A） | `data/video/clip/clip_lowResolution.pt` |
 | `data/video/clip_first_frame.mp4`（B） | `data/video/clip/clip_first_frame.pt` |
 
 每个 `.pt` 直接保存一个 CPU float32 Tensor，形状为 `[C, T, H, W]`，使用 `torch.load(path, map_location="cpu", weights_only=True)` 读取。它是仓库 VAE `encode()` 返回的归一化 latent。每次运行重新编码并覆盖这两个文件。
@@ -33,7 +47,7 @@ Linux 环境安装仓库依赖后即可运行。若已有环境缺少编码依�
 latent 和差值实验结果统一保存在 `data/video/clip/`：
 
 - `A-B.mp4`：`decode(encode(A) - encode(B))`
-- `clip.pt`、`clip_first_frame.pt`：A/B 的 latent。
+- `clip_lowResolution.pt`、`clip_first_frame.pt`：A/B 的 latent。
 - `metadata.json`：输入路径、权重路径、帧率、原始尺寸和 latent 形状等实验信息。
 
 A/B 必须具有相同的帧数、分辨率和帧率，否则脚本报错。重新运行第一步可生成与当前原视频匹配的 B。
@@ -58,7 +72,7 @@ python vae_video_diff.py --video_tag clip --vae_checkpoint /path/to/Wan2.2_VAE.p
 
 ## 残差注入去噪生成
 
-完成上述实验、得到 `data/video/clip/A-B.mp4` 后，运行：
+重新执行预处理及 VAE 差值实验，得到与低分辨率 A 匹配的 `data/video/clip/A-B.mp4` 后，运行（旧的高分辨率残差必须重新生成）：
 
 ```bash
 python generate_with_diff.py --video_tag clip --model_path /path/to/Wan2.2-TI2V-5B

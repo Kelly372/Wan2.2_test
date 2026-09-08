@@ -8,10 +8,37 @@ import unittest
 import imageio_ffmpeg
 import numpy as np
 
-from prepare_videos import read_video, write_rgb_video, write_still_video
+from prepare_videos import prepare_video, read_video, write_rgb_video, write_still_video
 
 
 class VideoEncodingTests(unittest.TestCase):
+    def test_preparation_resizes_motion_and_repeats_first_frame(self):
+        import cv2
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            low = Path(directory) / "source_lowResolution.mp4"
+            still = Path(directory) / "source_first_frame.mp4"
+            frames = [np.full((400, 704, 3), value, dtype=np.uint8) for value in (20, 100, 220)]
+            write_rgb_video(source, frames, 3, 24, (704, 400))
+            original_bytes = source.read_bytes()
+            prepare_video(source, low, still)
+            self.assertEqual(source.read_bytes(), original_bytes)
+            for path in (low, still):
+                first, count, fps = read_video(path)
+                self.assertEqual(first.shape, (384, 672, 3))
+                self.assertEqual(count, 3)
+                self.assertAlmostEqual(fps, 24)
+            for path, expected in ((low, (20, 100, 220)), (still, (20, 20, 20))):
+                capture = cv2.VideoCapture(str(path))
+                try:
+                    for value in expected:
+                        ok, frame = capture.read()
+                        self.assertTrue(ok)
+                        self.assertLess(abs(frame.mean() - value), 6)
+                finally:
+                    capture.release()
+
     def test_h264_color_dimensions_fps_and_faststart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "first_frame.mp4"

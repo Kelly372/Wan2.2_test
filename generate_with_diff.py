@@ -89,7 +89,8 @@ def run(args):
     checkpoint = resolve_checkpoint(args.model_path)
     video_dir = DATA_DIR / "video"
     output_dir = video_dir / args.video_tag
-    original, fps = read_rgb_video(video_dir / f"{args.video_tag}.mp4")
+    source_path = video_dir / f"{args.video_tag}_lowResolution.mp4"
+    original, fps = read_rgb_video(source_path)
     residual, residual_fps = read_rgb_video(output_dir / "A-B.mp4")
     if original.shape != residual.shape or not math.isclose(fps, residual_fps, rel_tol=1e-4, abs_tol=1e-3):
         raise ValueError("Original and A-B.mp4 must have matching frame count, dimensions and FPS.")
@@ -159,6 +160,7 @@ def run(args):
 
     metadata = {
         "model": "ti2v-5B", "checkpoint": str(checkpoint), "seed": args.seed,
+        "source_video": str(source_path),
         "prompt": args.prompt, "negative_prompt": pipe.sample_neg_prompt,
         "solver": "unipc", "inference_step": args.inference_step,
         "shift": cfg.sample_shift, "guide_scale": cfg.sample_guide_scale,

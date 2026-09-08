@@ -1,4 +1,4 @@
-"""Create a first-frame video from an existing video in data/video.
+"""Resize a video to H=384, W=672 and create its first-frame video.
 
 Usage: python prepare_videos.py --video_tag clip
 Requires opencv-python, numpy and imageio-ffmpeg (in requirements.txt).
@@ -13,6 +13,7 @@ import cv2
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+TARGET_SIZE = (672, 384)  # OpenCV uses (width, height).
 
 
 def file_name(value):
@@ -104,6 +105,33 @@ def write_still_video(path, frame, frame_count, fps):
     write_rgb_video(path, repeat(rgb, frame_count), frame_count, fps, (width, height))
 
 
+def prepare_video(source_path, low_resolution_path, first_frame_path):
+    first, frame_count, fps = read_video(source_path)
+    height, width = first.shape[:2]
+    print(f"Input: F={frame_count}, H={height}, W={width}, FPS={fps:g}")
+
+    def resized_frames():
+        capture = cv2.VideoCapture(str(source_path))
+        try:
+            if not capture.isOpened():
+                raise ValueError(f"Cannot open video: {source_path}")
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if frame.shape[:2] != (height, width):
+                    raise ValueError("Input video dimensions change between frames.")
+                resized = cv2.resize(frame, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+                yield cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        finally:
+            capture.release()
+
+    # Stream frames to avoid keeping the high-resolution clip in memory.
+    write_rgb_video(low_resolution_path, resized_frames(), frame_count, fps, TARGET_SIZE)
+    first, actual_count, actual_fps = read_video(low_resolution_path)
+    write_still_video(first_frame_path, first, actual_count, actual_fps)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video_tag", required=True, type=file_name)
@@ -111,10 +139,10 @@ def main():
 
     video_dir = DATA_DIR / "video"
     source_path = video_dir / f"{args.video_tag}.mp4"
+    low_resolution_path = video_dir / f"{args.video_tag}_lowResolution.mp4"
     first_frame_path = video_dir / f"{args.video_tag}_first_frame.mp4"
     try:
-        first_frame, frame_count, fps = read_video(source_path)
-        write_still_video(first_frame_path, first_frame, frame_count, fps)
+        prepare_video(source_path, low_resolution_path, first_frame_path)
     except (OSError, ValueError, RuntimeError, ImportError, cv2.error) as error:
         parser.exit(1, f"Error: {error}\n")
 
