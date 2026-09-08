@@ -58,8 +58,8 @@ def preview_scheduler_step(scheduler, prediction, timestep, latent):
 
 
 @contextmanager
-def attention_feature_hooks(model, directory, mode):
-    """Capture/replace every block.self_attn output after its output projection.
+def attention_feature_hooks(model, directory, mode, layer_indices=None):
+    """Capture/replace selected self-attention outputs (all layers by default).
 
     Disk-backed, one layer per file: only the current layer needs a transfer.
     Hooks never target cross-attention, FFN, latent input or scheduler state.
@@ -71,6 +71,10 @@ def attention_feature_hooks(model, directory, mode):
     blocks = list(model.blocks)
     if not blocks:
         raise ValueError('No DiT blocks found.')
+    indices = tuple(range(len(blocks))) if layer_indices is None else tuple(layer_indices)
+    if (not indices or len(set(indices)) != len(indices) or
+            any(not isinstance(index, int) or index not in range(len(blocks)) for index in indices)):
+        raise ValueError('Layer indices must be nonempty, unique integers within the model.')
     seen = set()
     handles = []
 
@@ -90,23 +94,24 @@ def attention_feature_hooks(model, directory, mode):
         return hook
 
     try:
-        for index, block in enumerate(blocks):
-            handles.append(block.self_attn.register_forward_hook(hook_for(index)))
+        for index in indices:
+            handles.append(blocks[index].self_attn.register_forward_hook(hook_for(index)))
         yield
-        if len(seen) != len(blocks):
-            raise RuntimeError(f'Only {len(seen)}/{len(blocks)} self-attention layers ran.')
+        if len(seen) != len(indices):
+            raise RuntimeError(f'Only {len(seen)}/{len(indices)} self-attention layers ran.')
     finally:
         for handle in handles:
             handle.remove()
 
 
-def swapped_model_prediction(pipe, recipient, donor, timestep, context, seq_len, cache_dir):
+def swapped_model_prediction(pipe, recipient, donor, timestep, context, seq_len, cache_dir,
+                             layer_indices=None):
     # The donor forward is never modified, and always starts from its own
     # independently recorded baseline latent at this exact update.
-    with attention_feature_hooks(pipe.model, cache_dir, 'capture'):
+    with attention_feature_hooks(pipe.model, cache_dir, 'capture', layer_indices):
         donor_prediction = pipe.model([donor], t=timestep, context=context, seq_len=seq_len)
     del donor_prediction
-    with attention_feature_hooks(pipe.model, cache_dir, 'replace'):
+    with attention_feature_hooks(pipe.model, cache_dir, 'replace', layer_indices):
         return pipe.model([recipient], t=timestep, context=context, seq_len=seq_len)[0]
 
 
@@ -114,7 +119,8 @@ def attention_trajectory(pipe, scheduler, initial, context, context_null,
                          guide_scale, output_dir, swap_index=None,
                          donor_snapshots=None, capture=False, self_check=False,
                          swap_indices=None, diagnostics=None,
-                         recipient_snapshots=None, capture_indices=None):
+                         recipient_snapshots=None, capture_indices=None,
+                         layer_indices=None):
     import torch
     from tqdm import tqdm
 
@@ -141,6 +147,7 @@ def attention_trajectory(pipe, scheduler, initial, context, context_null,
     snapshots = {}
     checks = []
     swap_count = 0
+    layer_kwargs = {} if layer_indices is None else {'layer_indices': tuple(layer_indices)}
     # Only one CFG pass worth of donor features is kept on disk at a time.
     with tempfile.TemporaryDirectory(prefix='attention_cache_', dir=output_dir) as cache_dir:
         with torch.amp.autocast('cuda', dtype=pipe.param_dtype):
@@ -164,7 +171,7 @@ def attention_trajectory(pipe, scheduler, initial, context, context_null,
                             normal = pipe.model([latent], t=timestep, context=ctx, seq_len=seq_len)[0]
                             normal_predictions.append(normal)
                         prediction = swapped_model_prediction(
-                            pipe, latent, donor, timestep, ctx, seq_len, cache_dir)
+                            pipe, latent, donor, timestep, ctx, seq_len, cache_dir, **layer_kwargs)
                         if diagnostics is not None:
                             record[f'{label}_prediction'] = difference_metrics(prediction, normal)
                             del normal
@@ -172,7 +179,7 @@ def attention_trajectory(pipe, scheduler, initial, context, context_null,
                         # This extra forward does not call scheduler.step or change
                         # the trajectory. Re-injecting one's own features must agree.
                         control = swapped_model_prediction(
-                            pipe, latent, latent, timestep, ctx, seq_len, cache_dir)
+                            pipe, latent, latent, timestep, ctx, seq_len, cache_dir, **layer_kwargs)
                         max_error = float((prediction - control).abs().max())
                         checks.append({'update': index + 1, 'cfg_branch': label,
                                        'max_abs_prediction_error': max_error})
