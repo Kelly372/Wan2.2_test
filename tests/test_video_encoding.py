@@ -8,7 +8,7 @@ import unittest
 import imageio_ffmpeg
 import numpy as np
 
-from prepare_videos import prepare_video, read_video, write_rgb_video, write_still_video
+from run_diff_video import prepare_video, read_video, write_rgb_video, write_still_video
 
 
 class VideoEncodingTests(unittest.TestCase):

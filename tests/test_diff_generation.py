@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from generate_with_diff import mix_initial_latent, normalize_dark_residual
+from run_diff_video import mix_initial_latent, normalize_dark_residual
 
 
 class DiffGenerationTests(unittest.TestCase):

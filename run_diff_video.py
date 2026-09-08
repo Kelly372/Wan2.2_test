@@ -1,6 +1,6 @@
 """Complete low-resolution residual video generation pipeline.
 
-Usage: python run_video_pipeline.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
+Usage: python run_diff_video.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
 Requires the repository's full inference dependencies and a CUDA GPU.
 This file contains all three processing stages; it does not import the earlier scripts.
 """
@@ -215,7 +215,7 @@ def run_vae_diff(args):
         if reference_shape is None:
             reference_shape, fps = (frames.shape, current_fps)
         if frames.shape != reference_shape or not math.isclose(current_fps, fps, rel_tol=0.0001, abs_tol=0.001):
-            raise ValueError(f'{label}: shape/FPS {frames.shape}/{current_fps} differs from A: {reference_shape}/{fps}. Regenerate B with prepare_videos.py.')
+            raise ValueError(f'{label}: shape/FPS {frames.shape}/{current_fps} differs from A: {reference_shape}/{fps}. Rerun run_diff_video.py to regenerate the matching inputs.')
         del frames
     count, height, width, _ = reference_shape
     if height % 2 or width % 2:

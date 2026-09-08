@@ -5,7 +5,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-import run_video_pipeline as pipeline
+import run_diff_video as pipeline
 
 
 class PipelineTests(unittest.TestCase):
