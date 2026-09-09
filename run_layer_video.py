@@ -1,4 +1,4 @@
-"""Compare self-attention layer groups, exchanging at updates 21-25 of 25.
+"""Compare single and paired attention layer groups at updates 21-25 of 25.
 
 python run_layer_video.py --model_path /path/to/Wan2.2-TI2V-5B --video_tag clip
 """
@@ -14,20 +14,49 @@ from run_diff_video import (
 from run_replace_video import attention_trajectory
 
 SWAP_UPDATES = tuple(range(20, 25))  # Zero-based; actual update numbers are 21-25.
+PAIR_MODES = ('front_middle', 'middle_back', 'front_back')
+LAYER_MODES = ('all', 'front', 'middle', 'back', 'pairs', *PAIR_MODES)
 
 
 def layer_groups(mode='all'):
-    groups = [('front', tuple(range(0, 10))),
-              ('middle', tuple(range(10, 20))),
-              ('back', tuple(range(20, 30)))]
-    if mode not in ('all', 'front', 'middle', 'back'):
+    singles = [('front', tuple(range(0, 10))),
+               ('middle', tuple(range(10, 20))),
+               ('back', tuple(range(20, 30)))]
+    pairs = [('front_middle', tuple(range(0, 20))),
+             ('middle_back', tuple(range(10, 30))),
+             ('front_back', tuple(range(0, 10)) + tuple(range(20, 30)))]
+    if mode not in LAYER_MODES:
         raise ValueError('Unknown layer mode.')
-    return [(name, indices) for name, indices in groups if mode in ('all', name)]
+    if mode == 'all':
+        return singles
+    if mode == 'pairs':
+        return pairs
+    return [(name, indices) for name, indices in singles + pairs if mode == name]
+
+
+def layer_range_label(layers):
+    """Keep disjoint ranges explicit: 00-09+20-29 must not read as 00-29."""
+    spans = []
+    start = end = layers[0]
+    for index in layers[1:]:
+        if index == end + 1:
+            end = index
+        else:
+            spans.append(f'{start:02d}-{end:02d}')
+            start = end = index
+    spans.append(f'{start:02d}-{end:02d}')
+    return '+'.join(spans)
+
+
+def layer_output_directory(video_tag, mode):
+    layer_groups(mode)  # Validate before choosing a result directory.
+    folder = 'attention_layer_pairs' if mode == 'pairs' or mode in PAIR_MODES else 'attention_layers'
+    return DATA_DIR / 'video' / video_tag / folder
 
 
 def layer_experiments(mode='all'):
     return [dict(mode=name, layers=layers, recipient=recipient, donor=donor,
-                 filename=f'layer_{name}_{layers[0]:02d}-{layers[-1]:02d}_'
+                 filename=f'layer_{name}_{layer_range_label(layers)}_'
                           f'swap_{recipient}_from_{donor}_updates21-25.mp4')
             for recipient, donor in (('A', 'B'), ('B', 'A'))
             for name, layers in layer_groups(mode)]
@@ -43,7 +72,7 @@ def run_layer_swap(args):
     cfg = WAN_CONFIGS['ti2v-5B']
     device = torch.device('cuda:0')
     torch.cuda.set_device(device)
-    output_dir = DATA_DIR / 'video' / args.video_tag / 'attention_layers'
+    output_dir = layer_output_directory(args.video_tag, args.layer_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = {'A': DATA_DIR / 'video' / f'{args.video_tag}_lowResolution.mp4',
              'B': DATA_DIR / 'video' / f'{args.video_tag}_first_frame.mp4'}
@@ -172,8 +201,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model_path', required=True)
     parser.add_argument('--video_tag', required=True, type=file_name)
-    parser.add_argument('--layer_mode', choices=('all', 'front', 'middle', 'back'), default='all',
-                        help='Default: all three groups in both directions, plus two baselines.')
+    parser.add_argument('--layer_mode', choices=LAYER_MODES, default='all',
+                        help='all: three single groups (default); pairs: three 20-layer combinations; '
+                             'or select one named group. Each runs both directions plus two baselines.')
     args = parser.parse_args()
     run_pipeline(args.model_path, args.video_tag, args.layer_mode)
 

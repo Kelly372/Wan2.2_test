@@ -41,10 +41,28 @@ class LayerVideoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             layer.layer_groups('invalid')
 
+    def test_pairs_have_twenty_layers_distinct_names_and_separate_outputs(self):
+        expected = {'front_middle': tuple(range(20)),
+                    'middle_back': tuple(range(10, 30)),
+                    'front_back': tuple(range(10)) + tuple(range(20, 30))}
+        self.assertEqual(dict(layer.layer_groups('pairs')), expected)
+        for mode, indices in expected.items():
+            self.assertEqual(len(set(indices)), 20)
+            self.assertEqual(layer.layer_groups(mode), [(mode, indices)])
+            self.assertEqual(len(layer.layer_experiments(mode)), 2)
+            self.assertEqual(layer.layer_output_directory('clip', mode).name, 'attention_layer_pairs')
+        names = {item['filename'] for item in layer.layer_experiments('pairs')}
+        old_names = {item['filename'] for item in layer.layer_experiments()}
+        self.assertEqual(len(names), 6)
+        self.assertTrue(names.isdisjoint(old_names))
+        self.assertIn('layer_front_back_00-09+20-29_swap_A_from_B_updates21-25.mp4', names)
+        self.assertEqual(layer.layer_output_directory('clip', 'pairs').name, 'attention_layer_pairs')
+        self.assertEqual(layer.layer_output_directory('clip', 'all').name, 'attention_layers')
+
     def test_only_selected_hooks_replace_outputs_other_layers_use_recipient_state(self):
         model = self.model()
         factors = [block.self_attn.factor for block in model.blocks]
-        for _, indices in layer.layer_groups():
+        for _, indices in layer.layer_groups() + layer.layer_groups('pairs'):
             with tempfile.TemporaryDirectory() as directory:
                 with shared.attention_feature_hooks(model, directory, 'capture', indices):
                     self.assertEqual([i for i, b in enumerate(model.blocks) if b.self_attn.hooks], list(indices))
@@ -112,7 +130,7 @@ class LayerVideoTests(unittest.TestCase):
                 _, baselines[name], _ = shared.attention_trajectory(
                     pipe, Scheduler(), initial[name], 1, 0, 2, directory,
                     capture=True, capture_indices=range(26))
-            for experiment in layer.layer_experiments():
+            for experiment in layer.layer_experiments() + layer.layer_experiments('pairs'):
                 recipient, donor = experiment['recipient'], experiment['donor']
                 solver, metrics = Scheduler(), []
                 with patch.object(shared, 'swapped_model_prediction', wraps=shared.swapped_model_prediction) as spy:
@@ -138,12 +156,13 @@ class LayerVideoTests(unittest.TestCase):
 
     def test_pipeline_prepares_and_forwards_mode(self):
         self.torch.cuda = types.SimpleNamespace(is_available=lambda: True)
-        with patch.object(layer, 'resolve_checkpoint', return_value=Path('models')), \
-                patch.object(layer, 'prepare_video') as prepare, \
-                patch.object(layer, 'run_layer_swap') as run:
-            layer.run_pipeline('models', 'clip', 'back')
-        self.assertEqual(prepare.call_args.args[1].name, 'clip_lowResolution.mp4')
-        self.assertEqual(run.call_args.args[0].layer_mode, 'back')
+        for mode in ('back', 'pairs', *layer.PAIR_MODES):
+            with patch.object(layer, 'resolve_checkpoint', return_value=Path('models')), \
+                    patch.object(layer, 'prepare_video') as prepare, \
+                    patch.object(layer, 'run_layer_swap') as run:
+                layer.run_pipeline('models', 'clip', mode)
+            self.assertEqual(prepare.call_args.args[1].name, 'clip_lowResolution.mp4')
+            self.assertEqual(run.call_args.args[0].layer_mode, mode)
 
 
 if __name__ == '__main__':
